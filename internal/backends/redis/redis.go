@@ -13,8 +13,10 @@ import (
 )
 
 const (
-	keyState = "vote_state_%d"
-	keyVote  = "vote_data_%d"
+	keyState          = "vote_state_%d"
+	keyVote           = "vote_data_%d"
+	keyCounter        = "vote_counter"
+	keyCounterChanges = "vote_counter_changes"
 )
 
 // Backend is a vote-Backend.
@@ -47,7 +49,7 @@ func New(addr string) *Backend {
 		pool: &pool,
 
 		luaScriptVote:     redis.NewScript(2, luaVoteScript),
-		luaScriptClearAll: redis.NewScript(0, luaClearAll),
+		luaScriptClearAll: redis.NewScript(2, luaClearAll),
 	}
 }
 
@@ -204,6 +206,8 @@ func (b *Backend) Clear(ctx context.Context, pollID int) error {
 
 // luaClearAll removes all vote related data from redis.
 //
+// KEYS[1] == count key
+// KEYS[2] == count change key
 // ARGV[1] == state key pattern
 // ARGV[2] == vote data pattern
 const luaClearAll = `
@@ -213,7 +217,10 @@ end
 
 for _, key in ipairs(redis.call("KEYS", ARGV[2])) do
 	redis.call("DEL", key)
-end`
+end
+
+redis.call("DEL", KEYS[1], KEYS[2])
+`
 
 // ClearAll removes all data from all polls.
 //
@@ -238,8 +245,8 @@ func (b *Backend) ClearAll(ctx context.Context) error {
 	voteKeyPattern := strings.ReplaceAll(keyVote, "%d", "*")
 	stateKeyPattern := strings.ReplaceAll(keyState, "%d", "*")
 
-	log.Debug("Redis: lua script clear all: '%s' 0 %s %s", luaClearAll, voteKeyPattern, stateKeyPattern)
-	if _, err := b.luaScriptClearAll.Do(conn, voteKeyPattern, stateKeyPattern); err != nil {
+	log.Debug("Redis: lua script clear all: '%s' 2 %s %s %s %s", luaClearAll, keyCounter, keyCounterChanges, voteKeyPattern, stateKeyPattern)
+	if _, err := b.luaScriptClearAll.Do(conn, keyCounter, keyCounterChanges, voteKeyPattern, stateKeyPattern); err != nil {
 		return fmt.Errorf("removing keys: %w", err)
 	}
 
@@ -267,20 +274,138 @@ func (b *Backend) VotedPolls(ctx context.Context, pollIDs []int, userID int) (ma
 	return out, nil
 }
 
-// VoteCount returns the amout of votes for the given poll id.
-func (b *Backend) VoteCount(ctx context.Context, pollID int) (int, error) {
+// CountAdd adds one to the count for the poll.
+func (b *Backend) CountAdd(ctx context.Context, pollID int) error {
 	conn := b.pool.Get()
 	defer conn.Close()
 
-	key := fmt.Sprintf(keyVote, pollID)
-
-	log.Debug("Redis: HLEN %s", key)
-	voteCount, err := redis.Int(conn.Do("HLEN", key))
-	if err != nil {
-		return 0, fmt.Errorf("removing keys: %w", err)
+	// TODO: Atomic
+	if _, err := conn.Do("HINCRBY", keyCounter, pollID, 1); err != nil {
+		return fmt.Errorf("incrising counter: %w", err)
 	}
 
-	return voteCount, nil
+	maxScore, err := b.maxID(conn)
+	if err != nil {
+		return fmt.Errorf("getting max score: %w", err)
+	}
+
+	if _, err := conn.Do("ZADD", keyCounterChanges, "GT", maxScore+1, pollID); err != nil {
+		return fmt.Errorf("add poll id to changed keys: %w", err)
+	}
+
+	return nil
+}
+
+// CountClear deletes all counts for a poll.
+func (b *Backend) CountClear(ctx context.Context, pollID int) error {
+	conn := b.pool.Get()
+	defer conn.Close()
+
+	if _, err := conn.Do("HDEL", keyCounter, pollID); err != nil {
+		return fmt.Errorf("delete counter: %w", err)
+	}
+
+	maxScore, err := b.maxID(conn)
+	if err != nil {
+		return fmt.Errorf("getting max score: %w", err)
+	}
+
+	if _, err := conn.Do("ZADD", keyCounterChanges, "GT", maxScore+1, pollID); err != nil {
+		return fmt.Errorf("add poll id to changed keys: %w", err)
+	}
+
+	return nil
+}
+
+func (b *Backend) maxID(conn redis.Conn) (uint64, error) {
+	rawMaxScore, err := redis.Uint64s(conn.Do("ZRANGE", keyCounterChanges, 0, 0, "REV", "WITHSCORES"))
+	if err != nil {
+		return 0, fmt.Errorf("calling zrange redis commant: %w", err)
+	}
+
+	var maxScore uint64
+	if len(rawMaxScore) > 1 {
+		maxScore = rawMaxScore[1]
+	}
+	return maxScore, nil
+}
+
+// Counters returns all counts of all polls since the given id.
+//
+// Returns a new ID that can be used the next time. Returns all counts for
+// all polls if the id 0 is given.
+//
+// Blocks until there is new data.
+func (b *Backend) Counters(ctx context.Context, id uint64, blocking bool) (newid uint64, counts map[int]int, err error) {
+	// TODO Atomic
+	conn := b.pool.Get()
+	defer conn.Close()
+
+	var pollIDs []int
+	for ctx.Err() == nil {
+		ids, err := b.counterRange(conn, id)
+		if err != nil {
+			return 0, nil, fmt.Errorf("getting changed poll ids: %w", err)
+		}
+
+		if len(ids) > 0 {
+			pollIDs = ids
+			break
+		}
+
+		if !blocking {
+			return id, nil, nil
+		}
+
+		time.Sleep(time.Second)
+	}
+
+	if ctx.Err() != nil {
+		return 0, nil, ctx.Err()
+	}
+
+	args := make([]interface{}, len(pollIDs)+1)
+	args[0] = keyCounter
+
+	for i, pid := range pollIDs {
+		args[i+1] = pid
+	}
+
+	// TODO: Maybe use HGETALL when id == 0
+	rawCounter, err := redis.Ints(conn.Do("HMGET", args...))
+	if err != nil {
+		return 0, nil, fmt.Errorf("calling `hmget %v`: %w", args, err)
+	}
+
+	counter := make(map[int]int, len(rawCounter))
+	for i, v := range rawCounter {
+		counter[pollIDs[i]] = v
+	}
+
+	maxScore, err := b.maxID(conn)
+	if err != nil {
+		return 0, nil, fmt.Errorf("getting max score: %w", err)
+	}
+
+	return maxScore, counter, nil
+}
+
+func (b *Backend) counterRange(conn redis.Conn, id uint64) ([]int, error) {
+	rawValues, err := redis.Uint64s(conn.Do("ZRANGE", keyCounterChanges, fmt.Sprintf("(%d", id), "+inf", "BYSCORE", "WITHSCORES"))
+	if err != nil {
+		return nil, fmt.Errorf("getting changed keys: %w", err)
+	}
+
+	pollIDs := make([]int, len(rawValues)/2)
+
+	for i, v := range rawValues {
+		if i%2 != 0 {
+			continue
+		}
+		pollIDs[i/2] = int(v)
+	}
+
+	return pollIDs, nil
 }
 
 type doesNotExistError struct {

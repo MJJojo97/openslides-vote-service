@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/OpenSlides/openslides-autoupdate-service/pkg/auth"
@@ -47,19 +48,12 @@ func Run(ctx context.Context, environment []string, getSecret func(name string) 
 		return fmt.Errorf("building auth: %w", err)
 	}
 
-	fastBackend, fastClose, err := buildBackend(ctx, env, getSecret, env["VOTE_BACKEND_FAST"])
+	fastBackend, longBackend, counter, err := buildBackends(ctx, env, getSecret)
 	if err != nil {
-		return fmt.Errorf("building fast backend: %w", err)
+		return fmt.Errorf("building backends: %w", err)
 	}
-	defer fastClose()
 
-	longBackend, longClose, err := buildBackend(ctx, env, getSecret, env["VOTE_BACKEND_LONG"])
-	if err != nil {
-		return fmt.Errorf("building long backend: %w", err)
-	}
-	defer longClose()
-
-	service := New(fastBackend, longBackend, ds, messageBus)
+	service := New(fastBackend, longBackend, ds, counter)
 
 	mux := http.NewServeMux()
 	handleCreate(mux, service)
@@ -129,7 +123,6 @@ func defaultEnv(environment []string) map[string]string {
 		"VOTE_DATABASE_NAME":          "vote",
 
 		"OPENSLIDES_DEVELOPMENT": "false",
-		"VOTE_DISABLE_LOG":       "false",
 	}
 
 	for _, value := range environment {
@@ -205,12 +198,14 @@ func buildAuth(
 	switch method {
 	case "ticket":
 		fmt.Println("Auth Method: ticket")
-		tokenKey, err := secret("auth_token_key", env, getSecret, env["OPENSLIDES_DEVELOPMENT"] != "false")
+		dev, _ := strconv.ParseBool(env["OPENSLIDES_DEVELOPMENT"])
+
+		tokenKey, err := secret("auth_token_key", env, getSecret, dev)
 		if err != nil {
 			return nil, fmt.Errorf("getting token secret: %w", err)
 		}
 
-		cookieKey, err := secret("auth_cookie_key", env, getSecret, env["OPENSLIDES_DEVELOPMENT"] != "false")
+		cookieKey, err := secret("auth_cookie_key", env, getSecret, dev)
 		if err != nil {
 			return nil, fmt.Errorf("getting cookie secret: %w", err)
 		}
@@ -260,7 +255,6 @@ func (a authStub) FromContext(ctx context.Context) int {
 type messageBus interface {
 	datastore.Updater
 	auth.LogoutEventer
-	MessageBus
 }
 
 func buildMessageBus(env map[string]string) (messageBus, error) {
@@ -289,49 +283,92 @@ func buildMessageBus(env map[string]string) (messageBus, error) {
 	return &messageBusRedis.Redis{Conn: conn}, nil
 }
 
-func buildBackend(ctx context.Context, env map[string]string, getSecret func(name string) (string, error), name string) (Backend, func(), error) {
-	switch name {
-	case "memory":
-		return memory.New(), func() {}, nil
-	case "redis":
-		addr := env["VOTE_REDIS_HOST"] + ":" + env["VOTE_REDIS_PORT"]
-		r := redis.New(addr)
-		r.Wait(ctx)
-		if ctx.Err() != nil {
-			return nil, nil, ctx.Err()
-		}
-
-		return r, func() {}, nil
-
-	case "postgres":
-		password := "openslides"
-		if env["OPENSLIDES_DEVELOPMENT"] == "false" {
-			filePassword, err := getSecret(env["VOTE_DATABASE_PASSWORD_FILE"])
-			if err != nil {
-				return nil, nil, fmt.Errorf("reading postgres password: %w", err)
-			}
-			password = filePassword
-		}
-
-		addr := fmt.Sprintf(
-			"postgres://%s@%s:%s/%s",
-			env["VOTE_DATABASE_USER"],
-			env["VOTE_DATABASE_HOST"],
-			env["VOTE_DATABASE_PORT"],
-			env["VOTE_DATABASE_NAME"],
-		)
-		p, err := postgres.New(ctx, addr, password)
-		if err != nil {
-			return nil, nil, fmt.Errorf("creating postgres connection pool: %w", err)
-		}
-
-		p.Wait(ctx)
-		if err := p.Migrate(ctx); err != nil {
-			return nil, nil, fmt.Errorf("creating shema: %w", err)
-		}
-		return p, p.Close, nil
-
-	default:
-		return nil, nil, fmt.Errorf("unknown backend %s", name)
+func buildRedisBackend(ctx context.Context, env map[string]string) (*redis.Backend, error) {
+	addr := env["VOTE_REDIS_HOST"] + ":" + env["VOTE_REDIS_PORT"]
+	r := redis.New(addr)
+	r.Wait(ctx)
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
 	}
+
+	return r, nil
+}
+
+func buildPostgresBackend(ctx context.Context, env map[string]string, getSecret func(name string) (string, error)) (*postgres.Backend, error) {
+	password := "openslides"
+	if env["OPENSLIDES_DEVELOPMENT"] == "false" {
+		filePassword, err := getSecret(env["VOTE_DATABASE_PASSWORD_FILE"])
+		if err != nil {
+			return nil, fmt.Errorf("reading postgres password: %w", err)
+		}
+		password = filePassword
+	}
+
+	addr := fmt.Sprintf(
+		"postgres://%s@%s:%s/%s",
+		env["VOTE_DATABASE_USER"],
+		env["VOTE_DATABASE_HOST"],
+		env["VOTE_DATABASE_PORT"],
+		env["VOTE_DATABASE_NAME"],
+	)
+	p, err := postgres.New(ctx, addr, password)
+	if err != nil {
+		return nil, fmt.Errorf("creating postgres connection pool: %w", err)
+	}
+
+	p.Wait(ctx)
+	if err := p.Migrate(ctx); err != nil {
+		return nil, fmt.Errorf("creating shema: %w", err)
+	}
+	return p, nil
+}
+
+func buildBackends(
+	ctx context.Context,
+	env map[string]string,
+	getSecret func(name string) (string, error),
+) (fast Backend, long Backend, counter Counter, err error) {
+	var rb *redis.Backend
+	var pb *postgres.Backend
+
+	setBackend := func(name string) (Backend, error) {
+		switch name {
+		case "memory":
+			return memory.New(), nil
+
+		case "redis":
+			if rb == nil {
+				rb, err = buildRedisBackend(ctx, env)
+				if err != nil {
+					return nil, fmt.Errorf("build redis backend: %w", err)
+				}
+			}
+			return rb, nil
+
+		case "postgres":
+			if pb == nil {
+				pb, err = buildPostgresBackend(ctx, env, getSecret)
+			}
+			return pb, nil
+
+		default:
+			return nil, fmt.Errorf("unknown backend %s", name)
+		}
+	}
+
+	fast, err = setBackend(env["VOTE_BACKEND_FAST"])
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("setting fast backend: %w", err)
+	}
+
+	long, err = setBackend(env["VOTE_BACKEND_LONG"])
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("setting long backend: %w", err)
+	}
+
+	counter = rb
+	if rb == nil {
+		counter = NewMockCounter()
+	}
+	return fast, long, counter, nil
 }

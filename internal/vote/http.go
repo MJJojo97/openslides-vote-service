@@ -2,7 +2,6 @@ package vote
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -26,7 +25,7 @@ func handleCreate(mux *http.ServeMux, create creater) {
 	mux.HandleFunc(
 		httpPathInternal+"/create",
 		func(w http.ResponseWriter, r *http.Request) {
-			log.Debug("Receive create request: %v", r)
+			log.Info("Receiving create request")
 			w.Header().Set("Content-Type", "application/json")
 
 			if r.Method != "POST" {
@@ -58,7 +57,7 @@ func handleStop(mux *http.ServeMux, stop stopper) {
 	mux.HandleFunc(
 		httpPathInternal+"/stop",
 		func(w http.ResponseWriter, r *http.Request) {
-			log.Debug("Receive stop request: %v", r)
+			log.Info("Receiving stop request")
 			w.Header().Set("Content-Type", "application/json")
 
 			if r.Method != "POST" {
@@ -88,7 +87,7 @@ func handleClear(mux *http.ServeMux, clear clearer) {
 	mux.HandleFunc(
 		httpPathInternal+"/clear",
 		func(w http.ResponseWriter, r *http.Request) {
-			log.Debug("Receive clear request: %v", r)
+			log.Info("Receiving clear request")
 			w.Header().Set("Content-Type", "application/json")
 
 			if r.Method != "POST" {
@@ -118,7 +117,7 @@ func handleClearAll(mux *http.ServeMux, clear clearAller) {
 	mux.HandleFunc(
 		httpPathInternal+"/clear_all",
 		func(w http.ResponseWriter, r *http.Request) {
-			log.Debug("Receive clear request: %v", r)
+			log.Info("Receiving clear all request")
 			w.Header().Set("Content-Type", "application/json")
 
 			if r.Method != "POST" {
@@ -147,7 +146,7 @@ func handleVote(mux *http.ServeMux, vote voter, auth authenticater) {
 	mux.HandleFunc(
 		httpPathExternal,
 		func(w http.ResponseWriter, r *http.Request) {
-			log.Debug("Receive vote request")
+			log.Info("Receiving vote request")
 			w.Header().Set("Content-Type", "application/json")
 
 			if r.Method != "POST" {
@@ -189,7 +188,7 @@ func handleVoted(mux *http.ServeMux, voted votedPollser, auth authenticater) {
 	mux.HandleFunc(
 		httpPathExternal+"/voted",
 		func(w http.ResponseWriter, r *http.Request) {
-			log.Debug("Receive voted request: %v", r)
+			log.Info("Receiving has voted request")
 			w.Header().Set("Content-Type", "application/json")
 
 			if r.Method != "GET" {
@@ -224,23 +223,31 @@ func handleVoted(mux *http.ServeMux, voted votedPollser, auth authenticater) {
 }
 
 type voteCounter interface {
-	VoteCount(ctx context.Context, pollIDs []int, w io.Writer) error
+	VoteCount(ctx context.Context, id uint64, blocking bool, w io.Writer) error
 }
 
 func handleVoteCount(mux *http.ServeMux, voteCounter voteCounter) {
 	mux.HandleFunc(
 		httpPathInternal+"/vote_count",
 		func(w http.ResponseWriter, r *http.Request) {
-			log.Debug("Receive vote count request: %v", r)
+			log.Info("Receiving vote count request")
 			w.Header().Set("Content-Type", "application/json")
 
-			pollIDs, err := parseVoteCountRequest(r.Body)
-			if err != nil {
-				handleError(w, fmt.Errorf("parse request: %w", err), true)
-				return
+			rawID := r.URL.Query().Get("id")
+			var id uint64
+			blocking := false
+			if rawID != "" {
+				blocking = true
+				var err error
+				id, err = strconv.ParseUint(rawID, 10, 64)
+				if err != nil {
+					handleError(w, fmt.Errorf("parsing id: %w", err), true)
+					return
+				}
+
 			}
 
-			if err := voteCounter.VoteCount(r.Context(), pollIDs, w); err != nil {
+			if err := voteCounter.VoteCount(r.Context(), id, blocking, w); err != nil {
 				handleError(w, err, true)
 				return
 			}
@@ -253,6 +260,7 @@ func handleHealth(mux *http.ServeMux) {
 	mux.HandleFunc(
 		httpPathExternal+"/health",
 		func(w http.ResponseWriter, r *http.Request) {
+			log.Info("Receiving health request")
 			w.Header().Set("Content-Type", "application/json")
 
 			fmt.Fprintf(w, `{"health":true}`)
@@ -284,32 +292,6 @@ func pollsID(r *http.Request) ([]int, error) {
 			return nil, fmt.Errorf("%dth id invalid. Expected int, got %s", i, rawID)
 		}
 		ids[i] = id
-	}
-
-	return ids, nil
-}
-
-func parseVoteCountRequest(r io.Reader) ([]int, error) {
-	var data struct {
-		Keys []string `json:"requests"`
-	}
-	if err := json.NewDecoder(r).Decode(&data); err != nil {
-		return nil, fmt.Errorf("decoding request body from jsin: %w", err)
-	}
-
-	var ids []int
-	for i, key := range data.Keys {
-		keyParts := strings.SplitN(key, "/", 3)
-
-		if keyParts[0] != "poll" || keyParts[2] != "vote_count" {
-			continue
-		}
-
-		id, err := strconv.Atoi(keyParts[1])
-		if err != nil {
-			return nil, fmt.Errorf("parsing %dth key %s is not an int", i, keyParts[1])
-		}
-		ids = append(ids, id)
 	}
 
 	return ids, nil
