@@ -941,6 +941,15 @@ func TestVoteCount(t *testing.T) {
 			entitled_group_ids: [1]
 			pollmethod: Y
 			global_yes: true
+		
+		3:
+			meeting_id: 1
+			entitled_group_ids: [1]
+			pollmethod: Y
+			option_ids: [1,2,3]
+			max_votes_amount: 4
+			max_votes_per_option: 3
+			
 	user:
 		5:
 			is_present_in_meeting_ids: [1]
@@ -951,6 +960,7 @@ func TestVoteCount(t *testing.T) {
 	`)), counter)
 	backend.Start(context.Background(), 1)
 	backend.Start(context.Background(), 2)
+	backend.Start(context.Background(), 3)
 
 	if err := v.Vote(context.Background(), 1, 5, strings.NewReader(`{"value":"Y"}`)); err != nil {
 		t.Fatalf("vote1: %v", err)
@@ -960,6 +970,12 @@ func TestVoteCount(t *testing.T) {
 	}
 	if err := v.Vote(context.Background(), 2, 5, strings.NewReader(`{"value":"Y"}`)); err != nil {
 		t.Fatalf("vote3: %v", err)
+	}
+	if err := v.Vote(context.Background(), 3, 5, strings.NewReader(`{"value":{"1":3,"2":0,"3":1}}`)); err != nil {
+		t.Fatalf("vote4: %v", err)
+	}
+	if err := v.Vote(context.Background(), 3, 6, strings.NewReader(`{"value":{"1":1,"2":2,"3":0}}`)); err != nil {
+		t.Fatalf("vote5: %v", err)
 	}
 
 	counter.WaitForID(3)
@@ -989,6 +1005,21 @@ func TestVoteCount(t *testing.T) {
 		}
 
 		expect := `{"id":3,"polls":{"2":1}}` + "\n"
+		if buf.String() != expect {
+			t.Errorf("VoteCount() wrote `%s`, expected `%s`", buf.String(), expect)
+		}
+	})
+
+	t.Run("test count for maxVotesPerOption>1", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
+		defer cancel()
+
+		buf := new(bytes.Buffer)
+		if err := v.VoteCount(ctx, 3, true, buf); err != nil {
+			t.Fatalf("VoteCount() returned unexected error: %v", err)
+		}
+
+		expect := `{"id":3,"polls":{"1":4,"2":2,"3":2}}` + "\n"
 		if buf.String() != expect {
 			t.Errorf("VoteCount() wrote `%s`, expected `%s`", buf.String(), expect)
 		}
